@@ -12,13 +12,14 @@ import csv, sys, math
 
 # --- EA input defaults (FTMO 2-Step after the review fixes) ---
 FAST, SLOW, RSI_P, ATR_P, ADX_P, LOOKBACK = 20, 50, 14, 14, 14, 20
-MIN_SCORE = 70.0
+import os
+MIN_SCORE = float(os.getenv('MIN_SCORE','70'))
 TREND_ADX_MIN, RANGE_ADX_MAX, MAX_ATR_PCT = 22.0, 18.0, 1.5
-RISK_PCT, STOP_ATR_MULT = 0.50, 2.0
+RISK_PCT, STOP_ATR_MULT = 0.50, float(os.getenv('STOP_ATR','2'))
 DAILY_LOSS_PCT, MAX_DD_PCT, INITIAL_CAPITAL = 5.0, 10.0, 100_000.0
 MAX_OPEN = 1
 PARTIAL_ATR_MULT, PARTIAL_PCT = 1.5, 50.0
-TRAIL_START_MULT, TRAIL_MULT = 2.0, 1.0
+TRAIL_START_MULT, TRAIL_MULT = float(os.getenv('TS','2')), float(os.getenv('TM','1'))
 PIP = 0.0001
 SPREAD = 1.2 * PIP  # 1.2 pip spread cost
 
