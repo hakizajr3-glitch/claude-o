@@ -20,8 +20,9 @@ input double MaximumATRPercent = 1.5;
 input group "Risk Control"
 input double RiskPerTradePercent = 0.50;
 input double StopATRMultiple = 2.0;
-input double DailyLossLimitPercent = 3.0;
-input double MaxDrawdownPercent = 8.0;
+input double DailyLossLimitPercent = 5.0; // FTMO 2-Step: max daily loss
+input double MaxDrawdownPercent = 10.0; // FTMO 2-Step: max overall loss
+input double InitialAccountCapital = 0.0; // FTMO initial simulated capital; 0 = use day-start equity
 input int MaxOpenPositions = 1;
 input long MagicNumber = 26071301;
 input int SlippagePoints = 10;
@@ -35,8 +36,31 @@ input double TrailATRMultiple = 1.0;
 CTrade trade;
 int fastMAHandle = INVALID_HANDLE, slowMAHandle = INVALID_HANDLE, rsiHandle = INVALID_HANDLE, atrHandle = INVALID_HANDLE, adxHandle = INVALID_HANDLE;
 datetime lastBarTime = 0, currentDay = 0;
-double peakEquity = 0.0;
+double peakEquity = 0.0, dayStartEquity = 0.0;
 bool dailyLock = false, drawdownLock = false;
+
+string GVKey(const string suffix)
+{
+   return "HorizonAI_" + (string)AccountInfoInteger(ACCOUNT_LOGIN) + "_" + suffix;
+}
+
+void PersistRiskState()
+{
+   GlobalVariableSet(GVKey("PeakEquity"), peakEquity);
+   GlobalVariableSet(GVKey("DrawdownLock"), drawdownLock ? 1.0 : 0.0);
+   GlobalVariableSet(GVKey("DailyLock"), dailyLock ? 1.0 : 0.0);
+   GlobalVariableSet(GVKey("CurrentDay"), (double)currentDay);
+   GlobalVariableSet(GVKey("DayStartEquity"), dayStartEquity);
+}
+
+void RestoreRiskState()
+{
+   if(GlobalVariableCheck(GVKey("PeakEquity"))) peakEquity = GlobalVariableGet(GVKey("PeakEquity"));
+   if(GlobalVariableCheck(GVKey("DrawdownLock"))) drawdownLock = GlobalVariableGet(GVKey("DrawdownLock")) > 0.5;
+   if(GlobalVariableCheck(GVKey("DailyLock"))) dailyLock = GlobalVariableGet(GVKey("DailyLock")) > 0.5;
+   if(GlobalVariableCheck(GVKey("CurrentDay"))) currentDay = (datetime)GlobalVariableGet(GVKey("CurrentDay"));
+   if(GlobalVariableCheck(GVKey("DayStartEquity"))) dayStartEquity = GlobalVariableGet(GVKey("DayStartEquity"));
+}
 
 bool Value(const int handle, const int buffer, const int shift, double &value)
 {
@@ -57,25 +81,33 @@ datetime DayStart(datetime value)
    return StructToTime(dt);
 }
 
+// FTMO resets max daily loss at midnight CE(S)T, which may differ from broker server time.
+datetime FTMODayStart()
+{
+   datetime utc = TimeGMT();
+   MqlDateTime dt;
+   TimeToStruct(utc, dt);
+   int offset = (dt.mon >= 4 && dt.mon <= 10) ? 2 : 1; // CEST late March-late Oct, CET otherwise (approximate DST edges)
+   datetime cet = utc + offset * 3600;
+   TimeToStruct(cet, dt);
+   dt.hour = 0;
+   dt.min = 0;
+   dt.sec = 0;
+   return StructToTime(dt) - offset * 3600;
+}
+
+// Account-wide closed P/L since the FTMO day start: daily-loss rules apply to the
+// whole account, not just this EA's magic number.
 double ClosedProfitToday()
 {
-   if(!HistorySelect(DayStart(TimeCurrent()), TimeCurrent())) return 0.0;
+   if(!HistorySelect(FTMODayStart(), TimeCurrent())) return 0.0;
    double total = 0.0;
    for(int i = 0; i < HistoryDealsTotal(); i++)
    {
       ulong ticket = HistoryDealGetTicket(i);
-      if(ticket > 0 && HistoryDealGetInteger(ticket, DEAL_MAGIC) == MagicNumber)
+      if(ticket > 0 && HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_IN)
          total += HistoryDealGetDouble(ticket, DEAL_PROFIT) + HistoryDealGetDouble(ticket, DEAL_SWAP) + HistoryDealGetDouble(ticket, DEAL_COMMISSION);
    }
-   return total;
-}
-
-double FloatingProfit()
-{
-   double total = 0.0;
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-      if(PositionGetTicket(i) > 0 && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
-         total += PositionGetDouble(POSITION_PROFIT);
    return total;
 }
 
@@ -89,19 +121,37 @@ int OpenPositionsCount()
 
 void UpdateRiskLocks()
 {
-   datetime today = DayStart(TimeCurrent());
+   datetime today = FTMODayStart();
    if(today != currentDay)
    {
       currentDay = today;
       dailyLock = false;
+      // Account-wide equity snapshot at the FTMO midnight reset.
+      dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      PersistRiskState();
    }
 
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   if(equity > peakEquity) peakEquity = equity;
+   if(equity > peakEquity)
+   {
+      peakEquity = equity;
+      PersistRiskState();
+   }
 
-   double closed = ClosedProfitToday(), dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE) - closed;
-   if(dayStartBalance > 0.0 && closed + FloatingProfit() <= -dayStartBalance * DailyLossLimitPercent / 100.0) dailyLock = true;
-   if(peakEquity > 0.0 && equity <= peakEquity * (1.0 - MaxDrawdownPercent / 100.0)) drawdownLock = true;
+   // FTMO max daily loss: equity at the CE(S)T midnight reset minus the limit,
+   // with the loss amount fixed to the initial simulated capital (2-Step rule).
+   double dayStart = (dayStartEquity > 0.0 ? dayStartEquity : equity);
+   double limitAmount = (InitialAccountCapital > 0.0 ? InitialAccountCapital : dayStart) * DailyLossLimitPercent / 100.0;
+   if(dayStart > 0.0 && AccountInfoDouble(ACCOUNT_EQUITY) <= dayStart - limitAmount && !dailyLock)
+   {
+      dailyLock = true;
+      PersistRiskState();
+   }
+   if(peakEquity > 0.0 && equity <= peakEquity * (1.0 - MaxDrawdownPercent / 100.0) && !drawdownLock)
+   {
+      drawdownLock = true;
+      PersistRiskState();
+   }
 }
 
 double NormalizeVolume(double volume)
@@ -170,13 +220,25 @@ void ManagePositions()
       {
          double closeVolume = NormalizeVolume(volume * PartialClosePercent / 100.0);
          double minimum = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-         if(closeVolume >= minimum && volume - closeVolume >= minimum && trade.PositionClosePartial(ticket, closeVolume))
+         if(closeVolume >= minimum && volume - closeVolume >= minimum)
          {
-            MarkPartialClosed(ticket);
-            double breakEven = NormalizeDouble(open, _Digits);
-            if((type == POSITION_TYPE_BUY && (sl == 0.0 || breakEven > sl)) || (type == POSITION_TYPE_SELL && (sl == 0.0 || breakEven < sl)))
-               if(trade.PositionModify(ticket, breakEven, tp)) sl = breakEven;
+            // Only mark as partially closed when the server actually accepted the
+            // request, so a rejection can be retried on the next tick.
+            if(trade.PositionClosePartial(ticket, closeVolume) && trade.ResultRetcode() == TRADE_RETCODE_DONE)
+               MarkPartialClosed(ticket);
+            else
+               Print("Partial close failed for ticket ", ticket, ", retcode=", trade.ResultRetcode(), ", comment=", trade.ResultComment());
          }
+      }
+
+      // Break-even: retried every tick until the server accepts it, instead of
+      // being skipped forever after a single failed modify.
+      if(HasPartialClosed(ticket))
+      {
+         double breakEven = NormalizeDouble(open, _Digits);
+         bool needsBE = (type == POSITION_TYPE_BUY && (sl == 0.0 || breakEven > sl)) || (type == POSITION_TYPE_SELL && (sl == 0.0 || breakEven < sl));
+         if(needsBE && !trade.PositionModify(ticket, breakEven, tp))
+            Print("Break-even modify failed for ticket ", ticket, ", retcode=", trade.ResultRetcode(), ", will retry");
       }
 
       if(profitDistance >= atr * TrailStartATRMultiple)
@@ -252,8 +314,21 @@ int OnInit()
 
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(SlippagePoints);
-   currentDay = DayStart(TimeCurrent());
-   peakEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   // Restore risk state so a re-init cannot reset a prior max-drawdown breach
+   // (peakEquity must not restart from reduced equity) or the daily lock.
+   RestoreRiskState();
+   currentDay = FTMODayStart();
+   if(GlobalVariableCheck(GVKey("CurrentDay")) && (datetime)GlobalVariableGet(GVKey("CurrentDay")) == currentDay)
+   {
+      if(dayStartEquity <= 0.0) dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   }
+   else
+   {
+      dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      currentDay = FTMODayStart();
+      PersistRiskState();
+   }
+   if(peakEquity <= 0.0) peakEquity = AccountInfoDouble(ACCOUNT_EQUITY);
    lastBarTime = iTime(_Symbol, SignalTimeframe, 0);
    return INIT_SUCCEEDED;
 }
